@@ -132,131 +132,202 @@ class DeliveryService {
         return distance * weight * COST_PER_KM_PER_KG;
     }
 
-    _getOptimalRoute(order) {
-        // Group products by warehouse
-        const warehouseGroups = {};
+    /**
+     * Calculate the total weight of products in an order
+     */
+    _calculateTotalWeight(order) {
+        return Object.values(order).reduce((sum, qty) => sum + qty, 0) * PRODUCT_WEIGHT;
+    }
+
+    /**
+     * Group order products by warehouse
+     */
+    _groupByWarehouse(order) {
+        const warehouseOrders = {};
+        
         for (const [product, quantity] of Object.entries(order)) {
             const warehouse = this._getWarehouseForProduct(product);
-            if (!warehouseGroups[warehouse]) {
-                warehouseGroups[warehouse] = {};
+            
+            if (!warehouseOrders[warehouse]) {
+                warehouseOrders[warehouse] = {};
             }
-            if (!warehouseGroups[warehouse][product]) {
-                warehouseGroups[warehouse][product] = 0;
+            
+            warehouseOrders[warehouse][product] = quantity;
+        }
+        
+        return warehouseOrders;
+    }
+
+    /**
+     * Calculate warehouse weights
+     */
+    _calculateWarehouseWeights(warehouseOrders) {
+        const weights = {};
+        
+        for (const [warehouse, products] of Object.entries(warehouseOrders)) {
+            weights[warehouse] = this._calculateTotalWeight(products);
+        }
+        
+        return weights;
+    }
+
+    /**
+     * Get all possible permutations of an array
+     */
+    _getPermutations(arr) {
+        if (arr.length <= 1) return [arr];
+        
+        const result = [];
+        
+        for (let i = 0; i < arr.length; i++) {
+            const current = arr[i];
+            const remaining = [...arr.slice(0, i), ...arr.slice(i + 1)];
+            const remainingPerms = this._getPermutations(remaining);
+            
+            for (const perm of remainingPerms) {
+                result.push([current, ...perm]);
             }
-            warehouseGroups[warehouse][product] += quantity;
         }
+        
+        return result;
+    }
 
-        // Calculate total weight for each warehouse
-        const warehouseWeights = {};
-        for (const [warehouse, products] of Object.entries(warehouseGroups)) {
-            warehouseWeights[warehouse] = Object.values(products).reduce((sum, qty) => sum + qty, 0) * PRODUCT_WEIGHT;
+    /**
+     * Generate all valid routes with or without intermediate L1 visits
+     */
+    _generateAllRoutes(warehouses) {
+        const allRoutes = [];
+        
+        // For each permutation of warehouse order
+        for (const warehousePerm of this._getPermutations(warehouses)) {
+            // Generate routes with different L1 visit patterns
+            this._generateRoutesWithL1(warehousePerm, [], allRoutes);
         }
+        
+        return allRoutes;
+    }
+    
+    /**
+     * Recursively generate all possible routes with L1 intermediate visits
+     */
+    _generateRoutesWithL1(remainingWarehouses, currentRoute, allRoutes) {
+        // Base case: no more warehouses to visit
+        if (remainingWarehouses.length === 0) {
+            // Must end with L1
+            if (currentRoute.length === 0 || currentRoute[currentRoute.length - 1] !== 'L1') {
+                currentRoute.push('L1');
+            }
+            allRoutes.push([...currentRoute]);
+            return;
+        }
+        
+        const nextWarehouse = remainingWarehouses[0];
+        const newRemaining = remainingWarehouses.slice(1);
+        
+        // Option 1: Visit next warehouse, then continue
+        this._generateRoutesWithL1(
+            newRemaining, 
+            [...currentRoute, nextWarehouse], 
+            allRoutes
+        );
+        
+        // Option 2: Visit next warehouse, go to L1, then continue
+        this._generateRoutesWithL1(
+            newRemaining, 
+            [...currentRoute, nextWarehouse, 'L1'], 
+            allRoutes
+        );
+    }
 
-        // If only one warehouse is needed, return direct route
-        const warehouses = Object.keys(warehouseGroups);
+    /**
+     * Calculate cost for a given route
+     */
+    _calculateRouteCost(route, warehouseWeights) {
+        let cost = 0;
+        let remainingWeights = { ...warehouseWeights };
+        let currentWeight = 0;
+        
+        // Convert route into leg segments
+        const legs = [];
+        for (let i = 0; i < route.length - 1; i++) {
+            legs.push([route[i], route[i + 1]]);
+        }
+        
+        for (const [from, to] of legs) {
+            // Skip invalid legs
+            if (from === to) continue;
+            
+            const distanceKey = `${from}-${to}`;
+            if (!DISTANCES[distanceKey]) {
+                console.error(`Missing distance for ${distanceKey}`);
+                return { cost: Infinity, route: [] };
+            }
+            
+            // Calculate current cargo weight
+            if (from !== 'L1') {
+                // Picking up from warehouse
+                if (remainingWeights[from]) {
+                    currentWeight += remainingWeights[from];
+                    delete remainingWeights[from];
+                }
+            }
+            
+            // Calculate cost for this leg
+            cost += this._calculateLegCost(DISTANCES[distanceKey], currentWeight);
+            
+            // If arriving at L1, delivery is made and cargo weight becomes 0
+            if (to === 'L1') {
+                currentWeight = 0;
+            }
+        }
+        
+        return { cost, route: legs.map(([from, to]) => `${from}-${to}`) };
+    }
+
+    /**
+     * Main function to calculate optimal route and minimum cost
+     */
+    _getOptimalRoute(order) {
+        // Group order by warehouse
+        const warehouseOrders = this._groupByWarehouse(order);
+        const warehouses = Object.keys(warehouseOrders);
+        
+        // If only one warehouse, direct route
         if (warehouses.length === 1) {
             const warehouse = warehouses[0];
+            const weight = this._calculateTotalWeight(warehouseOrders[warehouse]);
+            const distance = DISTANCES[`${warehouse}-L1`];
+            const cost = this._calculateLegCost(distance, weight);
+            
             return {
                 route: [`${warehouse}-L1`],
-                cost: this._calculateLegCost(DISTANCES[`${warehouse}-L1`], warehouseWeights[warehouse])
+                cost: cost
             };
         }
-
-        // For multiple warehouses, we need to consider various delivery strategies
-        return this._findBestDeliveryStrategy(warehouses, warehouseWeights);
-    }
-
-    _findBestDeliveryStrategy(warehouses, warehouseWeights) {
-        let bestCost = Infinity;
-        let bestRoute = [];
-
-        // Try each warehouse as starting point
-        for (const startWarehouse of warehouses) {
-            const remainingWarehouses = warehouses.filter(w => w !== startWarehouse);
-            
-            // Strategy 1: Visit all warehouses first, then deliver to L1 once
-            const strategy1 = this._calculateAllWarehousesThenL1(startWarehouse, remainingWarehouses, warehouseWeights);
-            if (strategy1.cost < bestCost) {
-                bestCost = strategy1.cost;
-                bestRoute = strategy1.route;
-            }
-
-            // Strategy 2: After each warehouse visit, decide whether to go to L1 or next warehouse
-            const strategy2 = this._calculateIntermediateL1Visits(startWarehouse, remainingWarehouses, warehouseWeights);
-            if (strategy2.cost < bestCost) {
-                bestCost = strategy2.cost;
-                bestRoute = strategy2.route;
-            }
-        }
-
-        return {
-            route: bestRoute,
-            cost: bestCost
-        };
-    }
-
-    _calculateAllWarehousesThenL1(startWarehouse, remainingWarehouses, warehouseWeights) {
+        
+        // Calculate weights for each warehouse
+        const warehouseWeights = this._calculateWarehouseWeights(warehouseOrders);
+        
+        // Generate all possible routes and find minimum cost
         let minCost = Infinity;
-        let optimalRoute = [];
-        const totalWeight = Object.values(warehouseWeights).reduce((a, b) => a + b, 0);
-
-        // Calculate cost for all permutations of remaining warehouses
-        for (const perm of this._getPermutations(remainingWarehouses)) {
-            const route = [startWarehouse, ...perm, 'L1'];
-            const routeSegments = [];
-            let cost = 0;
-            let currentWeight = totalWeight;
-
-            for (let i = 0; i < route.length - 1; i++) {
-                const from = route[i];
-                const to = route[i + 1];
-                const legKey = `${from}-${to}`;
-                
-                if (!DISTANCES[legKey]) {
-                    console.error(`Missing distance for ${legKey}`);
-                    continue;
-                }
-                
-                cost += this._calculateLegCost(DISTANCES[legKey], currentWeight);
-                routeSegments.push(legKey);
-                
-                // Reduce weight only if we're not at L1 yet
-                if (to !== 'L1') {
-                    currentWeight -= warehouseWeights[from];
-                }
-            }
-
-            if (cost < minCost) {
-                minCost = cost;
-                optimalRoute = routeSegments;
-            }
-        }
-
-        return {
-            route: optimalRoute,
-            cost: minCost
-        };
-    }
-
-    _calculateIntermediateL1Visits(startWarehouse, remainingWarehouses, warehouseWeights) {
-        // This strategy allows for visiting L1 between warehouse visits
-        // We'll use dynamic programming to find the best route
-        
-        // First, get all possible orderings of the warehouses
-        const allWarehousePermutations = this._getPermutations([startWarehouse, ...remainingWarehouses]);
-        
-        let bestCost = Infinity;
         let bestRoute = [];
         
-        for (const warehouseOrder of allWarehousePermutations) {
-            // For each warehouse, we have a choice: go to next warehouse or go to L1 first
-            const possibleRoutes = this._generateAllPossibleRoutes(warehouseOrder);
+        // Loop through each possible starting warehouse
+        for (const startWarehouse of warehouses) {
+            const otherWarehouses = warehouses.filter(w => w !== startWarehouse);
             
+            // Generate routes starting from this warehouse
+            const possibleRoutes = [[startWarehouse]];
+            this._generateRoutesWithL1([...otherWarehouses], [startWarehouse], possibleRoutes);
+            
+            // Calculate cost for each route
             for (const route of possibleRoutes) {
-                const { cost, segments } = this._calculateRouteCost(route, warehouseWeights);
+                // Make sure route ends at L1
+                const finalRoute = route[route.length - 1] === 'L1' ? route : [...route, 'L1'];
+                const { cost, route: segments } = this._calculateRouteCost(finalRoute, warehouseWeights);
                 
-                if (cost < bestCost) {
-                    bestCost = cost;
+                if (cost < minCost) {
+                    minCost = cost;
                     bestRoute = segments;
                 }
             }
@@ -264,93 +335,13 @@ class DeliveryService {
         
         return {
             route: bestRoute,
-            cost: bestCost
+            cost: minCost
         };
     }
-    
-    _generateAllPossibleRoutes(warehouseOrder) {
-        // Base case: always need to end at L1
-        if (warehouseOrder.length === 1) {
-            return [[warehouseOrder[0], 'L1']];
-        }
-        
-        const routes = [];
-        const firstWarehouse = warehouseOrder[0];
-        const remainingWarehouses = warehouseOrder.slice(1);
-        
-        // Option 1: Go directly to next warehouse
-        const subRoutes1 = this._generateAllPossibleRoutes(remainingWarehouses);
-        for (const subRoute of subRoutes1) {
-            routes.push([firstWarehouse, ...subRoute]);
-        }
-        
-        // Option 2: Go to L1 first, then to next warehouse
-        const subRoutes2 = this._generateAllPossibleRoutes(remainingWarehouses);
-        for (const subRoute of subRoutes2) {
-            routes.push([firstWarehouse, 'L1', ...subRoute]);
-        }
-        
-        return routes;
-    }
-    
-    _calculateRouteCost(route, warehouseWeights) {
-        let cost = 0;
-        const segments = [];
-        let currentWarehouseWeights = { ...warehouseWeights };
-        
-        for (let i = 0; i < route.length - 1; i++) {
-            const from = route[i];
-            const to = route[i + 1];
-            const legKey = `${from}-${to}`;
-            
-            if (!DISTANCES[legKey]) {
-                console.error(`Missing distance for ${legKey}`);
-                continue;
-            }
-            
-            // Calculate current total weight being carried
-            let currentWeight = 0;
-            if (from !== 'L1') {
-                for (const warehouse in currentWarehouseWeights) {
-                    if (warehouse === from || 
-                        (from !== 'L1' && i > 0 && route.slice(0, i).includes(warehouse) && !route.slice(0, i).includes('L1'))) {
-                        // We've picked up this warehouse's products but haven't visited L1 yet
-                        currentWeight += currentWarehouseWeights[warehouse];
-                    }
-                }
-            }
-            
-            cost += this._calculateLegCost(DISTANCES[legKey], currentWeight);
-            segments.push(legKey);
-            
-            // If we just arrived at L1, mark all previous warehouses as delivered
-            if (to === 'L1') {
-                for (let j = 0; j <= i; j++) {
-                    const visitedWarehouse = route[j];
-                    if (visitedWarehouse !== 'L1') {
-                        delete currentWarehouseWeights[visitedWarehouse];
-                    }
-                }
-            }
-        }
-        
-        return { cost, segments };
-    }
 
-    _getPermutations(arr) {
-        if (arr.length <= 1) return [arr];
-        const result = [];
-        for (let i = 0; i < arr.length; i++) {
-            const current = arr[i];
-            const remaining = [...arr.slice(0, i), ...arr.slice(i + 1)];
-            const remainingPerms = this._getPermutations(remaining);
-            for (const perm of remainingPerms) {
-                result.push([current, ...perm]);
-            }
-        }
-        return result;
-    }
-
+    /**
+     * Public method to calculate minimum cost
+     */
     calculateMinimumCost(order) {
         const { cost } = this._getOptimalRoute(order);
         return Math.round(cost);
